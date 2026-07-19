@@ -1,0 +1,16 @@
+*.o
+*.so
+*.bc
+*.dylib
+
+/results/
+/regression.diffs
+/regression.out
+/tmp_check/
+/log/
+
+*.gcda
+*.gcno
+*.gcov
+
+/pg_disorder-*.zip

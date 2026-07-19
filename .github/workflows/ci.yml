@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: PostgreSQL ${{ matrix.postgresql-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgresql-version: [14, 15, 16, 17, 18]
+
+    container:
+      image: pgxn/pgxn-tools
+
+    steps:
+      - name: Start PostgreSQL ${{ matrix.postgresql-version }}
+        run: pg-start ${{ matrix.postgresql-version }}
+
+      - name: Check out the source
+        uses: actions/checkout@v4
+
+      - name: Build, install, and run pg_regress
+        env:
+          NO_TAP: "1"
+          COPT: "-Werror"
+        run: pg-build-test
+
+      - name: Run TAP tests
+        run: |
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends libipc-run-perl
+          chmod -R a+rwX .
+          sudo -u postgres -H env "PATH=/usr/lib/postgresql/${{ matrix.postgresql-version }}/bin:$PATH" \
+            make installcheck REGRESS=

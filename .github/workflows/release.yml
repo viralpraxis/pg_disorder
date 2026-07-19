@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Bundle and release to PGXN
+    runs-on: ubuntu-latest
+
+    container:
+      image: pgxn/pgxn-tools
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v4
+
+      - name: Build and test
+        env:
+          NO_TAP: "1"
+          COPT: "-Werror"
+        run: pg-start 18 && pg-build-test
+
+      - name: Check version consistency
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          meta=$(grep -oP '"version"\s*:\s*"\K[^"]+' META.json | head -1)
+          src=$(grep -oP '#define PG_DISORDER_VERSION\s+"\K[^"]+' pg_disorder.c)
+          echo "tag=$tag  META.json=$meta  source=$src"
+          test "$tag" = "$meta" && test "$meta" = "$src"
+
+      - name: Bundle and release
+        env:
+          PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
+          PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
+        run: pgxn-bundle && pgxn-release

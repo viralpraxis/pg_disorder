@@ -1,0 +1,60 @@
+{
+   "name": "pg_disorder",
+   "abstract": "Shuffle the row order of unordered SELECTs to surface order-dependent tests",
+   "description": "pg_disorder is a PostgreSQL loadable module that injects ORDER BY random() into eligible top-level SELECT statements that have no ORDER BY. SQL does not specify the order of rows returned without an ORDER BY, so test suites quietly accumulate assumptions about implicit ordering that break later on a plan change, a VACUUM, or a dump/restore. pg_disorder turns that latent order-dependence into an immediate failure, and a per-session seed makes every failure reproducible. It is intended for test databases only and is disabled by default.",
+   "version": "0.1.0",
+   "maintainer": [
+      "viralpraxis <iaroslav2k@gmail.com>"
+   ],
+   "license": {
+      "PostgreSQL": "https://www.postgresql.org/about/licence/"
+   },
+   "provides": {
+      "pg_disorder": {
+         "file": "pg_disorder.c",
+         "version": "0.1.0",
+         "abstract": "Shuffle the row order of unordered SELECTs",
+         "docfile": "README.md"
+      }
+   },
+   "resources": {
+      "homepage": "https://github.com/viralpraxis/pg_disorder",
+      "bugtracker": {
+         "web": "https://github.com/viralpraxis/pg_disorder/issues"
+      },
+      "repository": {
+         "url": "https://github.com/viralpraxis/pg_disorder.git",
+         "web": "https://github.com/viralpraxis/pg_disorder",
+         "type": "git"
+      }
+   },
+   "tags": [
+      "testing",
+      "flaky tests",
+      "order by",
+      "random",
+      "planner hook",
+      "debugging"
+   ],
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "14.0.0"
+         }
+      }
+   },
+   "release_status": "stable",
+   "generated_by": "viralpraxis",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "no_index": {
+      "directory": [
+         "assets",
+         "expected",
+         "sql",
+         "t"
+      ]
+   }
+}
