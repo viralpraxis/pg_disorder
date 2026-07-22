@@ -57,13 +57,14 @@ Build against the *same major version* your server runs.
 |-----|------|---------|---------|
 | `pg_disorder.enabled` | bool | `off` | Master switch. |
 | `pg_disorder.seed` | int | `0` | Reproducibility seed. `0` picks a random seed once per session and logs it. Any non-zero value is used as-is. |
+| `pg_disorder.force_serial` | bool | `on` | Plans shuffled queries serially. `random()` is only parallel-restricted, so a parallel plan sorts rows in worker-arrival order and the same seed yields a different permutation on every run. Turning this off restores parallelism and gives up reproducibility. |
 
 ## Reproducing a failure
 
 The run's seed is written to the server log:
 
 ```
-LOG:  pg_disorder: session seed = 168799893 (replay with SET pg_disorder.seed = 168799893)
+LOG:  pg_disorder 0.1.0: session seed = 168799893 (replay with SET pg_disorder.seed = 168799893)
 ```
 
 Replay that exact ordering by pinning the seed:
@@ -72,9 +73,22 @@ Replay that exact ordering by pinning the seed:
 SET pg_disorder.seed = 168799893;
 ```
 
+Every statement derives its own seed from `pg_disorder.seed` and its query text, so replaying just the statement that failed reproduces its row order — you do not have to replay the whole session in the same order.
+
+A permutation is a function of the seed, the query text as submitted, and the plan. Reformatting the query changes it, and so does anything that changes the plan or the order rows reach the sort, such as a `VACUUM` or fresh statistics.
+
 ## What gets shuffled
 
 Only a top-level `SELECT` with no `ORDER BY`.
+
+### Not shuffled yet
+
+These shapes are currently passed through untouched:
+
+- `GROUP BY`, grouping sets, and aggregates
+- `DISTINCT` and `DISTINCT ON`
+- `UNION`, `INTERSECT`, `EXCEPT`
+- window functions
 
 ## Testing
 
