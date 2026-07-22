@@ -6,6 +6,7 @@
 #include "miscadmin.h"
 
 #include "catalog/pg_type.h"
+#include "common/hashfn.h"
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodes.h"
@@ -17,6 +18,7 @@
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
+#include "utils/plancache.h"
 
 PG_MODULE_MAGIC;
 
@@ -32,21 +34,18 @@ void _PG_init(void);
 
 static bool pg_disorder_enabled = false;
 static int  pg_disorder_seed = 0;
+static bool pg_disorder_force_serial = true;
 static char *pg_disorder_version = NULL;
-static bool seed_applied = false;
-static int  applied_seed = 0;
+
+static int  pg_disorder_session_seed = 0;
+static bool pg_disorder_session_seed_chosen = false;
 
 static planner_hook_type prev_planner_hook = NULL;
+static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun_hook = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish_hook = NULL;
 
 static int  pg_disorder_nesting_level = 0;
-
-static inline double
-pg_disorder_seed_to_double(int seed)
-{
-  return (double) seed / 2147483648.0;
-}
 
 static int
 pg_disorder_pick_seed(void)
@@ -60,32 +59,47 @@ pg_disorder_pick_seed(void)
 }
 
 
-static void
-pg_disorder_maybe_seed(void)
+static int
+pg_disorder_base_seed(void)
 {
-  int  effective;
-
   if (pg_disorder_seed != 0)
+    return pg_disorder_seed;
+
+  if (!pg_disorder_session_seed_chosen)
   {
-    if (seed_applied && applied_seed == pg_disorder_seed)
-      return;
-    effective = pg_disorder_seed;
-  }
-  else
-  {
-    if (seed_applied)
-      return;
-    effective = pg_disorder_pick_seed();
+    pg_disorder_session_seed = pg_disorder_pick_seed();
+    pg_disorder_session_seed_chosen = true;
     ereport(LOG,
         (errmsg("pg_disorder %s: session seed = %d "
             "(replay with SET pg_disorder.seed = %d)",
-            PG_DISORDER_VERSION, effective, effective)));
+            PG_DISORDER_VERSION,
+            pg_disorder_session_seed, pg_disorder_session_seed)));
   }
 
-  DirectFunctionCall1(setseed,
-            Float8GetDatum(pg_disorder_seed_to_double(effective)));
-  seed_applied = true;
-  applied_seed = pg_disorder_seed;
+  return pg_disorder_session_seed;
+}
+
+static double
+pg_disorder_statement_seed(int base, const char *sourceText)
+{
+  uint64  z = (uint64) (uint32) base;
+
+  if (sourceText != NULL)
+    z ^= ((uint64) hash_bytes((const unsigned char *) sourceText,
+                  (int) strlen(sourceText))) << 32;
+
+  z = (z ^ (z >> 30)) * UINT64CONST(0xBF58476D1CE4E5B9);
+  z = (z ^ (z >> 27)) * UINT64CONST(0x94D049BB133111EB);
+  z ^= z >> 31;
+
+  /* `setseed()` takes [-1, 1]; the low 32 bits cover it. */
+  return (double) (int32) (uint32) z / 2147483648.0;
+}
+
+static void
+pg_disorder_assign_replan(bool newval, void *extra)
+{
+  ResetPlanCache();
 }
 
 static bool
@@ -150,16 +164,34 @@ pg_disorder_planner(Query *parse, const char *query_string,
 {
   if (pg_disorder_is_eligible(parse))
   {
-    pg_disorder_maybe_seed();
-
     parse = copyObject(parse);
     pg_disorder_add_random_sort(parse);
+
+    if (pg_disorder_force_serial)
+      cursorOptions &= ~CURSOR_OPT_PARALLEL_OK;
   }
 
   if (prev_planner_hook)
     return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
 
   return standard_planner(parse, query_string, cursorOptions, boundParams);
+}
+
+static void
+pg_disorder_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+  if (pg_disorder_enabled
+    && pg_disorder_nesting_level == 0
+    && queryDesc->operation == CMD_SELECT)
+    DirectFunctionCall1(setseed,
+              Float8GetDatum(pg_disorder_statement_seed(
+                        pg_disorder_base_seed(),
+                        queryDesc->sourceText)));
+
+  if (prev_ExecutorStart_hook)
+    prev_ExecutorStart_hook(queryDesc, eflags);
+  else
+    standard_ExecutorStart(queryDesc, eflags);
 }
 
 #if PG_VERSION_NUM >= 180000
@@ -232,19 +264,34 @@ _PG_init(void)
                false,
                PGC_USERSET,
                0,
-               NULL, NULL, NULL);
+               NULL, pg_disorder_assign_replan, NULL);
 
   DefineCustomIntVariable("pg_disorder.seed",
               "Seed for reproducible shuffling (0 = auto + log).",
               "0 picks a random seed once per session and logs it, "
               "so a failure can be replayed by SET pg_disorder.seed to "
-              "the logged value.Any non-zero value is used as-is.",
+              "the logged value.Any non-zero value is used as-is. "
+              "Each statement derives its own seed from this one and its "
+              "query text, so a statement can be replayed on its own.",
               &pg_disorder_seed,
               0,
               INT_MIN, INT_MAX,
               PGC_USERSET,
               0,
               NULL, NULL, NULL);
+
+  DefineCustomBoolVariable("pg_disorder.force_serial",
+               "Plan shuffled queries serially so that a pinned seed "
+               "reproduces their row order.",
+               "random() is parallel-restricted, so a parallel plan sorts "
+               "rows in worker-arrival order and the same seed yields a "
+               "different permutation on every run. Turning this off "
+               "restores parallelism and gives up reproducibility.",
+               &pg_disorder_force_serial,
+               true,
+               PGC_USERSET,
+               0,
+               NULL, pg_disorder_assign_replan, NULL);
 
   DefineCustomStringVariable("pg_disorder.version",
               "pg_disorder version.",
@@ -263,6 +310,9 @@ _PG_init(void)
 
   prev_planner_hook = planner_hook;
   planner_hook = pg_disorder_planner;
+
+  prev_ExecutorStart_hook = ExecutorStart_hook;
+  ExecutorStart_hook = pg_disorder_ExecutorStart;
 
   prev_ExecutorRun_hook = ExecutorRun_hook;
   ExecutorRun_hook = pg_disorder_ExecutorRun;
