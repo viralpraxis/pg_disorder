@@ -37,7 +37,7 @@ $node->safe_psql('postgres', q{
 });
 my $insertion = join(',', 1 .. 30);
 
-my $enable = 'SET pg_disorder.enabled = on; SET pg_disorder.seed = 42;';
+my $enable = q{SET pg_disorder.mode = 'shuffle'; SET pg_disorder.seed = 42;};
 
 # Five executions are enough for the plan cache to switch to a generic plan, so
 # the sixth is served from the cache and never reaches the planner hook.
@@ -49,7 +49,7 @@ my $prime = q{
 # The session starts on an auto-picked seed, so if the pin were ignored (as it
 # is when the seed is only applied at plan time) each run would differ.
 my $pin_after_prime = qq{
-	SET pg_disorder.enabled = on;
+	SET pg_disorder.mode = 'shuffle';
 	$prime
 	SET pg_disorder.seed = 42;
 	EXECUTE q;
@@ -62,19 +62,19 @@ isnt($pinned, $insertion,
 is(tail_ids($pin_after_prime, 30), $pinned,
 	'pinned seed is honoured by a statement served from the plan cache');
 
-# Toggling pg_disorder.enabled has to invalidate cached plans, in both
-# directions, or the toggle silently does nothing for the rest of the session.
+# Changing pg_disorder.mode has to invalidate cached plans, in both
+# directions, or the change silently does nothing for the rest of the session.
 isnt(tail_ids(qq{
 	SET pg_disorder.seed = 42;
 	$prime
-	SET pg_disorder.enabled = on;
+	SET pg_disorder.mode = 'shuffle';
 	EXECUTE q;
 }, 30), $insertion, 'enabling after a generic plan is cached takes effect');
 
 is(tail_ids(qq{
-	SET pg_disorder.enabled = on; SET pg_disorder.seed = 42;
+	SET pg_disorder.mode = 'shuffle'; SET pg_disorder.seed = 42;
 	$prime
-	SET pg_disorder.enabled = off;
+	SET pg_disorder.mode = 'off';
 	EXECUTE q;
 }, 30), $insertion, 'disabling after a generic plan is cached takes effect');
 
@@ -97,7 +97,7 @@ $node->safe_psql('postgres', q{
 });
 
 my $parallel = q{
-	SET pg_disorder.enabled = on; SET pg_disorder.seed = 42;
+	SET pg_disorder.mode = 'shuffle'; SET pg_disorder.seed = 42;
 	SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0;
 	SET min_parallel_table_scan_size = 0;
 	SET max_parallel_workers_per_gather = 4;
