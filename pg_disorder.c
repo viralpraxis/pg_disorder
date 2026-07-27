@@ -32,7 +32,21 @@ PG_MODULE_MAGIC;
 
 void _PG_init(void);
 
-static bool pg_disorder_enabled = false;
+typedef enum
+{
+  PG_DISORDER_MODE_OFF = 0,
+  PG_DISORDER_MODE_REVERSE,
+  PG_DISORDER_MODE_SHUFFLE
+} PgDisorderMode;
+
+static const struct config_enum_entry pg_disorder_mode_options[] = {
+  {"off", PG_DISORDER_MODE_OFF, false},
+  {"reverse", PG_DISORDER_MODE_REVERSE, false},
+  {"shuffle", PG_DISORDER_MODE_SHUFFLE, false},
+  {NULL, 0, false}
+};
+
+static int  pg_disorder_mode = PG_DISORDER_MODE_OFF;
 static int  pg_disorder_seed = 0;
 static bool pg_disorder_force_serial = true;
 static char *pg_disorder_version = NULL;
@@ -40,12 +54,12 @@ static char *pg_disorder_version = NULL;
 static int  pg_disorder_session_seed = 0;
 static bool pg_disorder_session_seed_chosen = false;
 
+static int  pg_disorder_nesting_level = 0;
+
 static planner_hook_type prev_planner_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun_hook = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish_hook = NULL;
-
-static int  pg_disorder_nesting_level = 0;
 
 static int
 pg_disorder_pick_seed(void)
@@ -102,10 +116,16 @@ pg_disorder_assign_replan(bool newval, void *extra)
   ResetPlanCache();
 }
 
+static void
+pg_disorder_assign_mode(int newval, void *extra)
+{
+  ResetPlanCache();
+}
+
 static bool
 pg_disorder_is_eligible(Query *parse)
 {
-  return pg_disorder_enabled
+  return pg_disorder_mode != PG_DISORDER_MODE_OFF
     && pg_disorder_nesting_level == 0
     && parse->commandType == CMD_SELECT
     && parse->utilityStmt == NULL
@@ -122,40 +142,72 @@ pg_disorder_is_eligible(Query *parse)
 }
 
 static void
-pg_disorder_add_random_sort(Query *parse)
+pg_disorder_append_sort_key(Query *parse, Expr *expr, Oid exprType,
+              bool descending)
 {
-  FuncExpr *rnd;
   TargetEntry *tle;
   SortGroupClause *sgc;
-  Oid      sortop;
+  Oid      ltop;
+  Oid      gtop;
   Oid      eqop;
   bool    hashable;
 
-  rnd = makeFuncExpr(PG_DISORDER_RANDOM_OID, FLOAT8OID, NIL,
-           InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-
-  tle = makeTargetEntry((Expr *) rnd,
+  tle = makeTargetEntry(expr,
             (AttrNumber) (list_length(parse->targetList) + 1),
             NULL,
             true);
   parse->targetList = lappend(parse->targetList, tle);
 
-  get_sort_group_operators(FLOAT8OID,
-               true, true, false,
-               &sortop, &eqop, NULL,
+  get_sort_group_operators(exprType,
+               !descending, true, descending,
+               &ltop, &eqop, &gtop,
                &hashable);
 
   sgc = makeNode(SortGroupClause);
   sgc->tleSortGroupRef = assignSortGroupRef(tle, parse->targetList);
   sgc->eqop = eqop;
-  sgc->sortop = sortop;
+  sgc->sortop = descending ? gtop : ltop;
 #if PG_VERSION_NUM >= 180000
-  sgc->reverse_sort = false;
+  /* sortop is a greater-than operator exactly when we want descending order */
+  sgc->reverse_sort = descending;
 #endif
   sgc->nulls_first = false;
   sgc->hashable = hashable;
 
   parse->sortClause = lappend(parse->sortClause, sgc);
+}
+
+static void
+pg_disorder_add_random_sort(Query *parse)
+{
+  FuncExpr *rnd;
+
+  rnd = makeFuncExpr(PG_DISORDER_RANDOM_OID, FLOAT8OID, NIL,
+           InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+
+  pg_disorder_append_sort_key(parse, (Expr *) rnd, FLOAT8OID, false);
+}
+
+/* reverse: ORDER BY row_number() OVER () DESC */
+static void
+pg_disorder_add_reverse_sort(Query *parse)
+{
+  WindowClause *wc;
+  WindowFunc *wf;
+
+  wc = makeNode(WindowClause);
+  wc->frameOptions = FRAMEOPTION_DEFAULTS;
+  wc->winref = list_length(parse->windowClause) + 1;
+  parse->windowClause = lappend(parse->windowClause, wc);
+
+  wf = makeNode(WindowFunc);
+  wf->winfnoid = F_ROW_NUMBER;
+  wf->wintype = INT8OID;
+  wf->winref = wc->winref;
+  wf->location = -1;
+  parse->hasWindowFuncs = true;
+
+  pg_disorder_append_sort_key(parse, (Expr *) wf, INT8OID, true);
 }
 
 static PlannedStmt *
@@ -165,7 +217,11 @@ pg_disorder_planner(Query *parse, const char *query_string,
   if (pg_disorder_is_eligible(parse))
   {
     parse = copyObject(parse);
-    pg_disorder_add_random_sort(parse);
+
+    if (pg_disorder_mode == PG_DISORDER_MODE_REVERSE)
+      pg_disorder_add_reverse_sort(parse);
+    else
+      pg_disorder_add_random_sort(parse);
 
     if (pg_disorder_force_serial)
       cursorOptions &= ~CURSOR_OPT_PARALLEL_OK;
@@ -180,7 +236,7 @@ pg_disorder_planner(Query *parse, const char *query_string,
 static void
 pg_disorder_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-  if (pg_disorder_enabled
+  if (pg_disorder_mode == PG_DISORDER_MODE_SHUFFLE
     && pg_disorder_nesting_level == 0
     && queryDesc->operation == CMD_SELECT)
     DirectFunctionCall1(setseed,
@@ -254,17 +310,19 @@ pg_disorder_ExecutorFinish(QueryDesc *queryDesc)
 void
 _PG_init(void)
 {
-  DefineCustomBoolVariable("pg_disorder.enabled",
-               "Shuffle top-level SELECTs that lack ORDER BY.",
-               "When on, an ORDER BY random() is injected into "
-               "eligible unordered SELECTs to surface implicit "
-               "row-order assumptions.Intended for test "
-               "databases only.",
-               &pg_disorder_enabled,
-               false,
+  DefineCustomEnumVariable("pg_disorder.mode",
+               "How to perturb top-level SELECTs that lack ORDER BY.",
+               "off leaves queries untouched. reverse appends a "
+               "deterministic reversal of the row order. shuffle appends "
+               "ORDER BY random(). Both surface implicit row-order "
+               "assumptions; reverse is reproducible without a seed. "
+               "Intended for test databases only.",
+               &pg_disorder_mode,
+               PG_DISORDER_MODE_OFF,
+               pg_disorder_mode_options,
                PGC_USERSET,
                0,
-               NULL, pg_disorder_assign_replan, NULL);
+               NULL, pg_disorder_assign_mode, NULL);
 
   DefineCustomIntVariable("pg_disorder.seed",
               "Seed for reproducible shuffling (0 = auto + log).",
@@ -281,12 +339,13 @@ _PG_init(void)
               NULL, NULL, NULL);
 
   DefineCustomBoolVariable("pg_disorder.force_serial",
-               "Plan shuffled queries serially so that a pinned seed "
-               "reproduces their row order.",
-               "random() is parallel-restricted, so a parallel plan sorts "
-               "rows in worker-arrival order and the same seed yields a "
-               "different permutation on every run. Turning this off "
-               "restores parallelism and gives up reproducibility.",
+               "Plan perturbed queries serially so that their row order "
+               "is reproducible.",
+               "The injected sort key is parallel-restricted, so a parallel "
+               "plan feeds the sort in worker-arrival order and the same "
+               "input yields a different row order on every run -- defeating "
+               "both a pinned seed (shuffle) and reverse's determinism. "
+               "Turning this off restores parallelism and gives that up.",
                &pg_disorder_force_serial,
                true,
                PGC_USERSET,
