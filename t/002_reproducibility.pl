@@ -117,5 +117,28 @@ unlike($node->safe_psql('postgres',
 is(ids("$parallel SELECT id FROM big"), ids("$parallel SELECT id FROM big"),
 	'a pinned seed reproduces across sessions with parallelism available');
 
+# The same has to hold for reverse, whose sort key is the window function
+# itself rather than a hash of it.
+my $parallel_reverse = q{
+	SET pg_disorder.mode = 'reverse';
+	SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0;
+	SET min_parallel_table_scan_size = 0;
+	SET max_parallel_workers_per_gather = 4;
+};
+
+like($node->safe_psql('postgres',
+		"$parallel_reverse SET pg_disorder.force_serial = off;
+		 EXPLAIN (COSTS OFF) SELECT id FROM big"),
+	qr/Gather/,
+	'the reversed query really would go parallel on its own');
+
+unlike($node->safe_psql('postgres',
+		"$parallel_reverse EXPLAIN (COSTS OFF) SELECT id FROM big"),
+	qr/Gather/,
+	'force_serial keeps a reversed query serial');
+
+is(ids("$parallel_reverse SELECT id FROM big"), join(',', reverse 1 .. 5000),
+	'reverse is an exact reversal even with parallelism available');
+
 $node->stop;
 done_testing();
