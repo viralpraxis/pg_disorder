@@ -5,30 +5,28 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 
+#include "catalog/pg_language_d.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
 #include "optimizer/planner.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_oper.h"
+#include "tcop/utility.h"
 #include "utils/fmgroids.h"
-#include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/plancache.h"
+#include "utils/syscache.h"
 
 PG_MODULE_MAGIC;
 
-#define PG_DISORDER_VERSION "0.1.0"
-
-#if PG_VERSION_NUM >= 170000
-#define PG_DISORDER_RANDOM_OID  F_RANDOM_
-#else
-#define PG_DISORDER_RANDOM_OID  F_RANDOM
-#endif
+#define PG_DISORDER_VERSION "0.2.0"
 
 void _PG_init(void);
 
@@ -57,9 +55,11 @@ static bool pg_disorder_session_seed_chosen = false;
 static int  pg_disorder_nesting_level = 0;
 
 static planner_hook_type prev_planner_hook = NULL;
-static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun_hook = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
+static needs_fmgr_hook_type prev_needs_fmgr_hook = NULL;
+static fmgr_hook_type prev_fmgr_hook = NULL;
 
 static int
 pg_disorder_pick_seed(void)
@@ -93,7 +93,7 @@ pg_disorder_base_seed(void)
   return pg_disorder_session_seed;
 }
 
-static double
+static int64
 pg_disorder_statement_seed(int base, const char *sourceText)
 {
   uint64  z = (uint64) (uint32) base;
@@ -106,20 +106,38 @@ pg_disorder_statement_seed(int base, const char *sourceText)
   z = (z ^ (z >> 27)) * UINT64CONST(0x94D049BB133111EB);
   z ^= z >> 31;
 
-  /* `setseed()` takes [-1, 1]; the low 32 bits cover it. */
-  return (double) (int32) (uint32) z / 2147483648.0;
+  return (int64) z;
 }
 
 static void
-pg_disorder_assign_replan(bool newval, void *extra)
+pg_disorder_replan_bool(bool newval, void *extra)
 {
   ResetPlanCache();
 }
 
 static void
-pg_disorder_assign_mode(int newval, void *extra)
+pg_disorder_replan_int(int newval, void *extra)
 {
   ResetPlanCache();
+}
+
+static bool
+pg_disorder_row_marks_walker(Node *node, void *context)
+{
+  if (node == NULL)
+    return false;
+
+  if (IsA(node, Query))
+  {
+    Query    *query = (Query *) node;
+
+    if (query->rowMarks != NIL)
+      return true;
+
+    return query_tree_walker(query, pg_disorder_row_marks_walker, context, 0);
+  }
+
+  return expression_tree_walker(node, pg_disorder_row_marks_walker, context);
 }
 
 static bool
@@ -136,9 +154,10 @@ pg_disorder_is_eligible(Query *parse)
     && parse->groupingSets == NIL
     && !parse->hasAggs
     && !parse->hasWindowFuncs
-    && parse->rowMarks == NIL
+    && !parse->hasRecursive
     && parse->jointree != NULL
-    && parse->jointree->fromlist != NIL;
+    && parse->jointree->fromlist != NIL
+    && !pg_disorder_row_marks_walker((Node *) parse, NULL);
 }
 
 static void
@@ -177,20 +196,8 @@ pg_disorder_append_sort_key(Query *parse, Expr *expr, Oid exprType,
   parse->sortClause = lappend(parse->sortClause, sgc);
 }
 
-static void
-pg_disorder_add_random_sort(Query *parse)
-{
-  FuncExpr *rnd;
-
-  rnd = makeFuncExpr(PG_DISORDER_RANDOM_OID, FLOAT8OID, NIL,
-           InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-
-  pg_disorder_append_sort_key(parse, (Expr *) rnd, FLOAT8OID, false);
-}
-
-/* reverse: ORDER BY row_number() OVER () DESC */
-static void
-pg_disorder_add_reverse_sort(Query *parse)
+static Expr *
+pg_disorder_row_number(Query *parse)
 {
   WindowClause *wc;
   WindowFunc *wf;
@@ -207,13 +214,42 @@ pg_disorder_add_reverse_sort(Query *parse)
   wf->location = -1;
   parse->hasWindowFuncs = true;
 
-  pg_disorder_append_sort_key(parse, (Expr *) wf, INT8OID, true);
+  return (Expr *) wf;
+}
+
+/* reverse: ORDER BY row_number() OVER () DESC */
+static void
+pg_disorder_add_reverse_sort(Query *parse)
+{
+  pg_disorder_append_sort_key(parse, pg_disorder_row_number(parse),
+                INT8OID, true);
+}
+
+static void
+pg_disorder_add_shuffle_sort(Query *parse, int64 seed)
+{
+  Const    *seedConst;
+  Expr     *rownum;
+  FuncExpr *mixed;
+
+  seedConst = makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+             Int64GetDatum(seed), false, FLOAT8PASSBYVAL);
+
+  rownum = pg_disorder_row_number(parse);
+
+  mixed = makeFuncExpr(F_HASHINT8EXTENDED, INT8OID,
+             list_make2(rownum, seedConst),
+             InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+
+  pg_disorder_append_sort_key(parse, (Expr *) mixed, INT8OID, false);
 }
 
 static PlannedStmt *
 pg_disorder_planner(Query *parse, const char *query_string,
         int cursorOptions, ParamListInfo boundParams)
 {
+  PlannedStmt *volatile result = NULL;
+
   if (pg_disorder_is_eligible(parse))
   {
     parse = copyObject(parse);
@@ -221,33 +257,30 @@ pg_disorder_planner(Query *parse, const char *query_string,
     if (pg_disorder_mode == PG_DISORDER_MODE_REVERSE)
       pg_disorder_add_reverse_sort(parse);
     else
-      pg_disorder_add_random_sort(parse);
+      pg_disorder_add_shuffle_sort(parse,
+                     pg_disorder_statement_seed(
+                       pg_disorder_base_seed(),
+                       query_string));
 
     if (pg_disorder_force_serial)
       cursorOptions &= ~CURSOR_OPT_PARALLEL_OK;
   }
 
-  if (prev_planner_hook)
-    return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
+  pg_disorder_nesting_level++;
+  PG_TRY();
+  {
+    if (prev_planner_hook)
+      result = prev_planner_hook(parse, query_string, cursorOptions, boundParams);
+    else
+      result = standard_planner(parse, query_string, cursorOptions, boundParams);
+  }
+  PG_FINALLY();
+  {
+    pg_disorder_nesting_level--;
+  }
+  PG_END_TRY();
 
-  return standard_planner(parse, query_string, cursorOptions, boundParams);
-}
-
-static void
-pg_disorder_ExecutorStart(QueryDesc *queryDesc, int eflags)
-{
-  if (pg_disorder_mode == PG_DISORDER_MODE_SHUFFLE
-    && pg_disorder_nesting_level == 0
-    && queryDesc->operation == CMD_SELECT)
-    DirectFunctionCall1(setseed,
-              Float8GetDatum(pg_disorder_statement_seed(
-                        pg_disorder_base_seed(),
-                        queryDesc->sourceText)));
-
-  if (prev_ExecutorStart_hook)
-    prev_ExecutorStart_hook(queryDesc, eflags);
-  else
-    standard_ExecutorStart(queryDesc, eflags);
+  return result;
 }
 
 #if PG_VERSION_NUM >= 180000
@@ -307,6 +340,114 @@ pg_disorder_ExecutorFinish(QueryDesc *queryDesc)
   PG_END_TRY();
 }
 
+static bool
+pg_disorder_execute_evaluates_params(Node *stmt)
+{
+  if (stmt != NULL && IsA(stmt, Query))
+    stmt = ((Query *) stmt)->utilityStmt;
+
+  return stmt != NULL
+    && IsA(stmt, ExecuteStmt)
+    && ((ExecuteStmt *) stmt)->params != NIL;
+}
+
+static bool
+pg_disorder_utility_runs_top_level_query(Node *stmt)
+{
+  switch (nodeTag(stmt))
+  {
+    case T_CreateTableAsStmt:
+      return !pg_disorder_execute_evaluates_params(
+                ((CreateTableAsStmt *) stmt)->query);
+    case T_ExplainStmt:
+      return !pg_disorder_execute_evaluates_params(
+                ((ExplainStmt *) stmt)->query);
+    case T_ExecuteStmt:
+      return !pg_disorder_execute_evaluates_params(stmt);
+    case T_RefreshMatViewStmt:
+    case T_DeclareCursorStmt:
+    case T_PrepareStmt:
+      return true;
+    case T_CopyStmt:
+      return !((CopyStmt *) stmt)->is_from;
+    default:
+      return false;
+  }
+}
+
+static void
+pg_disorder_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+               bool readOnlyTree, ProcessUtilityContext context,
+               ParamListInfo params, QueryEnvironment *queryEnv,
+               DestReceiver *dest, QueryCompletion *qc)
+{
+  Node     *stmt = pstmt->utilityStmt;
+  volatile bool nested = stmt != NULL
+    && !pg_disorder_utility_runs_top_level_query(stmt);
+
+  if (nested)
+    pg_disorder_nesting_level++;
+
+  PG_TRY();
+  {
+    if (prev_ProcessUtility_hook)
+      prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context,
+                   params, queryEnv, dest, qc);
+    else
+      standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+                  params, queryEnv, dest, qc);
+  }
+  PG_FINALLY();
+  {
+    if (nested)
+      pg_disorder_nesting_level--;
+  }
+  PG_END_TRY();
+}
+
+static bool
+pg_disorder_needs_fmgr_hook(Oid fn_oid)
+{
+  HeapTuple  tuple;
+  Oid      lang;
+  bool    needed;
+
+  if (prev_needs_fmgr_hook && prev_needs_fmgr_hook(fn_oid))
+    return true;
+
+  tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
+  if (!HeapTupleIsValid(tuple))
+    return false;
+
+  lang = ((Form_pg_proc) GETSTRUCT(tuple))->prolang;
+  needed = lang != INTERNALlanguageId
+    && lang != ClanguageId
+    && lang != SQLlanguageId;
+
+  ReleaseSysCache(tuple);
+
+  return needed;
+}
+
+static void
+pg_disorder_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *arg)
+{
+  switch (event)
+  {
+    case FHET_START:
+      pg_disorder_nesting_level++;
+      break;
+    case FHET_END:
+    case FHET_ABORT:
+      if (pg_disorder_nesting_level > 0)
+        pg_disorder_nesting_level--;
+      break;
+  }
+
+  if (prev_fmgr_hook)
+    prev_fmgr_hook(event, flinfo, arg);
+}
+
 void
 _PG_init(void)
 {
@@ -314,21 +455,21 @@ _PG_init(void)
                "How to perturb top-level SELECTs that lack ORDER BY.",
                "off leaves queries untouched. reverse appends a "
                "deterministic reversal of the row order. shuffle appends "
-               "ORDER BY random(). Both surface implicit row-order "
-               "assumptions; reverse is reproducible without a seed. "
-               "Intended for test databases only.",
+               "a seeded pseudorandom permutation. Both surface implicit "
+               "row-order assumptions; reverse is reproducible without a "
+               "seed. Intended for test databases only.",
                &pg_disorder_mode,
                PG_DISORDER_MODE_OFF,
                pg_disorder_mode_options,
                PGC_USERSET,
                0,
-               NULL, pg_disorder_assign_mode, NULL);
+               NULL, pg_disorder_replan_int, NULL);
 
   DefineCustomIntVariable("pg_disorder.seed",
               "Seed for reproducible shuffling (0 = auto + log).",
               "0 picks a random seed once per session and logs it, "
               "so a failure can be replayed by SET pg_disorder.seed to "
-              "the logged value.Any non-zero value is used as-is. "
+              "the logged value. Any non-zero value is used as-is. "
               "Each statement derives its own seed from this one and its "
               "query text, so a statement can be replayed on its own.",
               &pg_disorder_seed,
@@ -336,21 +477,22 @@ _PG_init(void)
               INT_MIN, INT_MAX,
               PGC_USERSET,
               0,
-              NULL, NULL, NULL);
+              NULL, pg_disorder_replan_int, NULL);
 
   DefineCustomBoolVariable("pg_disorder.force_serial",
                "Plan perturbed queries serially so that their row order "
                "is reproducible.",
-               "The injected sort key is parallel-restricted, so a parallel "
-               "plan feeds the sort in worker-arrival order and the same "
-               "input yields a different row order on every run -- defeating "
-               "both a pinned seed (shuffle) and reverse's determinism. "
-               "Turning this off restores parallelism and gives that up.",
+               "The injected sort key is built on a window function, which "
+               "is parallel-restricted, so a parallel plan feeds it in "
+               "worker-arrival order and the same input yields a different "
+               "row order on every run -- defeating both a pinned seed "
+               "(shuffle) and reverse's determinism. Turning this off "
+               "restores parallelism and gives that up.",
                &pg_disorder_force_serial,
                true,
                PGC_USERSET,
                0,
-               NULL, pg_disorder_assign_replan, NULL);
+               NULL, pg_disorder_replan_bool, NULL);
 
   DefineCustomStringVariable("pg_disorder.version",
               "pg_disorder version.",
@@ -370,12 +512,18 @@ _PG_init(void)
   prev_planner_hook = planner_hook;
   planner_hook = pg_disorder_planner;
 
-  prev_ExecutorStart_hook = ExecutorStart_hook;
-  ExecutorStart_hook = pg_disorder_ExecutorStart;
-
   prev_ExecutorRun_hook = ExecutorRun_hook;
   ExecutorRun_hook = pg_disorder_ExecutorRun;
 
   prev_ExecutorFinish_hook = ExecutorFinish_hook;
   ExecutorFinish_hook = pg_disorder_ExecutorFinish;
+
+  prev_ProcessUtility_hook = ProcessUtility_hook;
+  ProcessUtility_hook = pg_disorder_ProcessUtility;
+
+  prev_needs_fmgr_hook = needs_fmgr_hook;
+  needs_fmgr_hook = pg_disorder_needs_fmgr_hook;
+
+  prev_fmgr_hook = fmgr_hook;
+  fmgr_hook = pg_disorder_fmgr_hook;
 }

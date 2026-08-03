@@ -36,3 +36,108 @@ jobs:
           chmod -R a+rwX .
           sudo -u postgres -H env "PATH=/usr/lib/postgresql/${{ matrix.postgresql-version }}/bin:$PATH" \
             make installcheck REGRESS=
+
+  crash-sweep:
+    name: Crash sweep on PostgreSQL ${{ matrix.postgresql-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        postgresql-version: [14, 15, 16, 17, 18]
+
+    container:
+      image: pgxn/pgxn-tools
+
+    env:
+      PGBIN: /usr/lib/postgresql/${{ matrix.postgresql-version }}/bin
+      SWEEP: /tmp/sweep
+
+    steps:
+      - name: Start PostgreSQL ${{ matrix.postgresql-version }}
+        run: pg-start ${{ matrix.postgresql-version }}
+
+      - name: Check out the source
+        uses: actions/checkout@v4
+
+      - name: Build and install pg_disorder
+        env:
+          COPT: "-Werror"
+        run: make PG_CONFIG=$PGBIN/pg_config && make PG_CONFIG=$PGBIN/pg_config install
+
+      - name: Download the matching PostgreSQL regression corpus
+        run: |
+          set -eu
+          ver=$($PGBIN/pg_config --version | awk '{print $2}')
+          echo "server version: $ver"
+          curl -sSfLo /tmp/pg.tar.gz \
+            "https://ftp.postgresql.org/pub/source/v${ver}/postgresql-${ver}.tar.gz"
+          tar xzf /tmp/pg.tar.gz -C /tmp "postgresql-${ver}/src/test/regress"
+          echo "REGRESS_DIR=/tmp/postgresql-${ver}/src/test/regress" >> "$GITHUB_ENV"
+
+      - name: Run the PostgreSQL core suite with pg_disorder preloaded
+        run: |
+          set -eu
+          printf '%s\n' \
+            "session_preload_libraries = 'pg_disorder'" \
+            "pg_disorder.mode = 'reverse'" \
+            "temp_file_limit = '2GB'" \
+            "statement_timeout = '120s'" > /tmp/pgd.conf
+          mkdir -p "$SWEEP"
+          chmod -R a+rwX "$SWEEP" /tmp/pgd.conf /tmp/postgresql-*
+          cd "$REGRESS_DIR"
+          sudo -u postgres -H env "PATH=$PGBIN:$PATH" \
+            "$($PGBIN/pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress" \
+              --temp-instance="$SWEEP/inst" --temp-config=/tmp/pgd.conf \
+              --bindir="$PGBIN" --inputdir=. --outputdir="$SWEEP" \
+              --schedule=./parallel_schedule --max-connections=10 \
+            > "$SWEEP/run.log" 2>&1 || true
+          tail -3 "$SWEEP/run.log"
+
+      - name: Assert no crash, hang, or unbounded plan
+        run: |
+          set -u
+          fail=0
+          if grep -qiE "PANIC|segmentation fault|terminated by signal|was terminated by|TRAP:" \
+               "$SWEEP/log/postmaster.log" 2>/dev/null; then
+            echo "::error::server crash detected in postmaster.log"
+            grep -iE "PANIC|segmentation fault|terminated by signal|was terminated by|TRAP:" \
+              "$SWEEP/log/postmaster.log" | head -10
+            fail=1
+          fi
+          if grep -rqi "server closed the connection unexpectedly\|connection to server was lost" \
+               "$SWEEP/results" 2>/dev/null; then
+            echo "::error::a backend died mid-test"
+            grep -rli "server closed the connection unexpectedly\|connection to server was lost" \
+              "$SWEEP/results" | head -10
+            fail=1
+          fi
+          if grep -rq 'exceeds "temp_file_limit"' "$SWEEP/results" 2>/dev/null; then
+            echo "::error::a query exceeded temp_file_limit -- unbounded plan, e.g. a blocking sort over an unbounded source"
+            grep -rl 'exceeds "temp_file_limit"' "$SWEEP/results" | head -10
+            fail=1
+          fi
+          if grep -rq "canceling statement due to statement timeout" "$SWEEP/results" 2>/dev/null; then
+            echo "::error::a statement timed out -- likely a non-terminating plan"
+            grep -rl "canceling statement due to statement timeout" "$SWEEP/results" | head -10
+            fail=1
+          fi
+          if ! grep -qE "tests passed|tests failed" "$SWEEP/run.log" 2>/dev/null; then
+            echo "::error::the suite did not run to completion (hang or abort)"
+            tail -5 "$SWEEP/run.log"
+            fail=1
+          fi
+          echo "tests executed: $(grep -cE '^(not )?ok [0-9]+' "$SWEEP/run.log" || true)"
+          [ "$fail" -eq 0 ] && echo "crash sweep clean"
+          exit $fail
+
+      - name: Upload sweep logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-sweep-${{ matrix.postgresql-version }}
+          path: |
+            /tmp/sweep/run.log
+            /tmp/sweep/log/postmaster.log
+            /tmp/sweep/regression.diffs
+          retention-days: 7
