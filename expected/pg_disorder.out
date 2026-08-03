@@ -262,6 +262,23 @@ SELECT id FROM (SELECT id FROM t) plain LIMIT 5;
  16
 (5 rows)
 
+WITH RECURSIVE r(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM r)
+SELECT * FROM r LIMIT 3;
+ n 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+WITH plain_cte AS (SELECT id FROM t) SELECT * FROM plain_cte LIMIT 3;
+ id 
+----
+ 20
+ 19
+ 18
+(3 rows)
+
 CREATE FUNCTION pg_disorder_sql_exec_arg() RETURNS int LANGUAGE sql AS $$
   SELECT id FROM t LIMIT 1;
 $$;

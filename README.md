@@ -130,7 +130,8 @@ These shapes are currently passed through untouched, in both `reverse` and `shuf
 - `UNION`, `INTERSECT`, `EXCEPT`
 - window functions
 - `SELECT`s with no `FROM` clause
-- `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`. Reordering a locking scan reorders lock acquisition, which can manufacture deadlocks that have nothing to do with the order assumption under test.
+- `WITH RECURSIVE`. The injected sort is a blocking operator, so it must drain its input before returning a row. A recursive CTE is allowed to be infinite when a `LIMIT` stops it -- PostgreSQL's own test suite contains one -- and perturbing that turns a query that returns in under a millisecond into one that never returns and fills the disk with temporary files.
+- `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`, wherever they appear in the query, including inside a subquery or CTE. Reordering a locking scan reorders lock acquisition, which can manufacture deadlocks that have nothing to do with the order assumption under test; and because the injected sort is blocking, a `LIMIT` would no longer stop it before it locked every row.
 - anything that is not a `SELECT`, including `INSERT ... SELECT`. Note the asymmetry with `CREATE TABLE AS SELECT`, which *is* perturbed: a fixture loaded with `INSERT ... SELECT` keeps its source order, the same fixture loaded with `CREATE TABLE AS` does not.
 
 ## How it works

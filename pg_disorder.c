@@ -154,6 +154,7 @@ pg_disorder_is_eligible(Query *parse)
     && parse->groupingSets == NIL
     && !parse->hasAggs
     && !parse->hasWindowFuncs
+    && !parse->hasRecursive
     && parse->jointree != NULL
     && parse->jointree->fromlist != NIL
     && !pg_disorder_row_marks_walker((Node *) parse, NULL);
