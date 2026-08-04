@@ -21,6 +21,18 @@ All non-EOL PostgreSQL versions are supported.
 
 Build against the *same major version* your server runs.
 
+### From PGXN
+
+With the [PGXN client](https://pgxn.github.io/pgxnclient/):
+
+```sh
+pgxn install pg_disorder
+```
+
+`pgxn install` builds from source, so it needs the same prerequisites as below. It shells out to `sudo` for the install step, and picks the server to build against from the first `pg_config` on your `PATH` -- pass `--pg_config /path/to/pg_config` when you have several major versions installed.
+
+### From source
+
 1. Prerequisites: a C compiler, `make`, and the PostgreSQL server headers:
 
    ```sh
@@ -41,14 +53,22 @@ Build against the *same major version* your server runs.
    sudo make install
    ```
 
-3. Enable it:
+### Enable it
 
-   Load it for every session on your test database, and turn it on:
+Installing only puts the library on disk. Load it for every session on your test database, and turn it on:
 
-   ```sql
-   ALTER DATABASE <database-name> SET session_preload_libraries = 'pg_disorder';
-   ALTER DATABASE <database-name> SET pg_disorder.mode = 'reverse';
-   ```
+```sql
+ALTER DATABASE <database-name> SET session_preload_libraries = 'pg_disorder';
+ALTER DATABASE <database-name> SET pg_disorder.mode = 'reverse';
+```
+
+Then check that it is really loaded, from a *new* connection to that database:
+
+```sql
+SHOW pg_disorder.version;
+```
+
+If that errors with `unrecognized configuration parameter`, the library is not loaded. Note that `SHOW pg_disorder.mode` is *not* a valid check: dotted GUC names are accepted as placeholders even when the module is absent, so it will report whatever you set while nothing is actually perturbed.
 
 ## Modes
 
@@ -67,7 +87,7 @@ SET pg_disorder.mode = 'reverse';
 SELECT id FROM ord;                       -- 1..10 -- assumption survives
 ```
 
-It is also a no-op on results of zero or one row. Neither mode can prove a test is order-independent; both can only disprove it. `shuffle` across several seeds is the stronger check.
+Neither mode can prove a test is order-independent; both can only disprove it. `shuffle` across several seeds is the stronger check.
 
 A statement's permutation is a function of the seed and the query text, not of how many times it has run, so `shuffle` samples one permutation *per session*, not per execution: running the same statement twice in one session returns the same order both times. That is what makes a failure replayable from the seed alone. To sample more of the order space, vary the seed across runs rather than repeating a statement within one.
 
@@ -78,9 +98,7 @@ A statement's permutation is a function of the seed and the query text, not of h
 | `pg_disorder.mode` | enum | `off` | Master switch: `off`, `reverse`, or `shuffle`. |
 | `pg_disorder.seed` | int | `0` | Shuffle-only reproducibility seed. `0` picks a random seed once per session and logs it. Any non-zero value is used as-is. Ignored in `reverse` mode. |
 | `pg_disorder.force_serial` | bool | `on` | Plans perturbed queries serially. The injected sort key is built on a window function, which is parallel-restricted, so a parallel plan feeds it in worker-arrival order and the same input yields a different row order every run -- defeating both a pinned seed and reverse's determinism. Turning this off restores parallelism and gives that up. |
-| `pg_disorder.version` | string | `0.2.0` | Read-only; the version of the loaded module. Cannot be set, and is rejected in `postgresql.conf`. |
-
-`SHOW pg_disorder.version` is also the dependable way to confirm the library is really loaded on a connection. `SHOW pg_disorder.mode` is not: on a connection that never loaded the library, PostgreSQL accepts `pg_disorder.mode` as a placeholder, so `SET` reports success and `SHOW` echoes the value back while nothing is being perturbed. The version GUC fails with `unrecognized configuration parameter` in that case instead of quietly agreeing with you.
+| `pg_disorder.version` | string | `0.2.0` | Read-only; the version of the loaded module. |
 
 ## Reproducing a failure
 
@@ -110,17 +128,6 @@ Only a top-level `SELECT` with no `ORDER BY`. This is the same set in both modes
 
 "Top-level" means the statement you submitted. Queries planned inside a function, procedure, trigger, event trigger or `DO` block are never perturbed, no matter what fired them -- see [How it works](#how-it-works).
 
-### It changes results, not just order
-
-A `SELECT` with `LIMIT` but no `ORDER BY` returns an arbitrary *subset*, so perturbing it changes which rows come back, not merely the order they arrive in:
-
-```sql
-SET pg_disorder.mode = 'reverse';
-SELECT id FROM t LIMIT 5;   -- 20, 19, 18, 17, 16 -- not 1, 2, 3, 4, 5
-```
-
-This is deliberate: an unordered `LIMIT` is among the most common order-dependent bugs, and the whole point is to make it fail. But it does mean `CREATE TABLE AS ... LIMIT n` stores a different set of rows, so do not assume the result multiset is preserved.
-
 ### Not perturbed yet
 
 These shapes are currently passed through untouched, in both `reverse` and `shuffle` modes:
@@ -134,16 +141,6 @@ These shapes are currently passed through untouched, in both `reverse` and `shuf
 - `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`, wherever they appear in the query, including inside a subquery or CTE. Reordering a locking scan reorders lock acquisition, which can manufacture deadlocks that have nothing to do with the order assumption under test; and because the injected sort is blocking, a `LIMIT` would no longer stop it before it locked every row.
 - anything that is not a `SELECT`, including `INSERT ... SELECT`. Note the asymmetry with `CREATE TABLE AS SELECT`, which *is* perturbed: a fixture loaded with `INSERT ... SELECT` keeps its source order, the same fixture loaded with `CREATE TABLE AS` does not.
 
-## How it works
-
-pg_disorder installs a `planner_hook`. For each eligible query it appends one extra hidden column to the target list -- `row_number() OVER ()` -- and adds an `ORDER BY` on it. In `reverse` mode that ordering is simply descending. In `shuffle` mode it is ascending on `hashint8extended(row_number() OVER (), <statement seed>)`, which scatters the row positions pseudorandomly. PostgreSQL then plans and runs the query as usual and the hidden column is dropped before rows are returned. With `force_serial` on, the hook also clears the query's parallel flag, so the sort receives its input in a deterministic order.
-
-The statement seed is folded into the plan as a constant at plan time, so pg_disorder never calls `setseed()` and never disturbs the session's own random number generator. `random()` inside your own queries behaves exactly as it does with `pg_disorder.mode = 'off'`, and a `setseed()` you issue yourself is honoured.
-
-pg_disorder also tracks executor, utility and function nesting, so a query is perturbed only when it is the statement you actually submitted. A query planned inside a function body is left alone regardless of how that body was reached -- a plain call, a row trigger under `COPY`, a constraint trigger deferred to commit, an event trigger, a `DEFAULT` expression evaluated by `COPY` or an `ALTER TABLE` rewrite, `CALL`, or `DO`. That matters beyond the immediate result: eligibility is decided at plan time and function plans are cached for the session, so perturbing a body even once would leave a poisoned plan behind and keep returning the wrong row from every later call.
-
-Only the utility statements that exist to run a query you wrote stay perturbable: `CREATE TABLE AS`, `SELECT INTO`, `CREATE`/`REFRESH MATERIALIZED VIEW`, `COPY (SELECT ...) TO`, `DECLARE CURSOR`, `EXECUTE`, and `EXPLAIN`.
-
 ### Known limitations
 
 - `REFRESH MATERIALIZED VIEW CONCURRENTLY` builds its diff with internal queries that run at the same level as the refresh itself, so they are perturbed too. This does not change the refreshed contents, but it does change which of several offending rows a `contains duplicate rows` error names in its `DETAIL`.
@@ -151,7 +148,7 @@ Only the utility statements that exist to run a query you wrote stay perturbable
 
 ## Real-world findings
 
-- [Ruby on Rails](https://github.com/rails/rails): [Bug #58177](https://github.com/rails/rails/pull/58177)
+- [Ruby on Rails](https://github.com/rails/rails): [Bug #58177](https://github.com/rails/rails/pull/58177), [suite flaky tests](https://github.com/rails/rails/pull/58267)
 
 ## Testing
 
