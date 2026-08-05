@@ -2,7 +2,7 @@
    "name": "pg_disorder",
    "abstract": "Perturb the row order of unordered SELECTs to surface order-dependent tests",
    "description": "pg_disorder is a PostgreSQL loadable module that perturbs the row order of eligible top-level SELECT statements that have no ORDER BY, either by reversing it (reverse mode, deterministic and seedless) or by applying a seeded pseudorandom permutation (shuffle mode). SQL does not specify the order of rows returned without an ORDER BY, so test suites quietly accumulate assumptions about implicit ordering that break later on a plan change, a VACUUM, or a dump/restore. pg_disorder turns that latent order-dependence into an immediate failure, and every failure is reproducible: reverse needs no seed at all, and shuffle derives each statement's permutation from a per-session seed and the query text. Function, trigger and procedure bodies are left untouched. It is intended for test databases only and is disabled by default.",
-   "version": "0.2.0",
+   "version": "0.1.0",
    "maintainer": [
       "viralpraxis <iaroslav2k@gmail.com>"
    ],
@@ -12,7 +12,7 @@
    "provides": {
       "pg_disorder": {
          "file": "pg_disorder.c",
-         "version": "0.2.0",
+         "version": "0.1.0",
          "abstract": "Perturb the row order of unordered SELECTs",
          "docfile": "README.md"
       }

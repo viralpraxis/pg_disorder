@@ -96,7 +96,7 @@ Neither mode can prove a test is order-independent; `shuffle` across several see
 | `pg_disorder.mode` | enum | `off` | Master switch: `off`, `reverse`, or `shuffle`. |
 | `pg_disorder.seed` | int | `0` | Shuffle-only reproducibility seed. `0` picks a random seed once per session and logs it. Any non-zero value is used as-is. Ignored in `reverse` mode. |
 | `pg_disorder.force_serial` | bool | `on` | Plans perturbed queries serially. The injected sort key is built on a window function, which is parallel-restricted, so a parallel plan feeds it in worker-arrival order and the same input yields a different row order every run, defeating both a pinned seed and reverse's determinism. Turning this off restores parallelism and gives that up. |
-| `pg_disorder.version` | string | `0.2.0` | Read-only; the version of the loaded module. |
+| `pg_disorder.version` | string | `0.1.0` | Read-only; the version of the loaded module. |
 
 ## Reproducing a failure
 
@@ -105,7 +105,7 @@ Neither mode can prove a test is order-independent; `shuffle` across several see
 The run's seed is written to the server log:
 
 ```
-LOG:  pg_disorder 0.2.0: session seed = 168799893 (replay with SET pg_disorder.seed = 168799893)
+LOG:  pg_disorder 0.1.0: session seed = 168799893 (replay with SET pg_disorder.seed = 168799893)
 ```
 
 Replay that exact ordering by pinning the seed:
