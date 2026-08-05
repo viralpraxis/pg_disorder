@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="assets/logo.png" alt="pg_disorder" width="440">
+  <img src="https://raw.githubusercontent.com/viralpraxis/pg_disorder/main/assets/logo.png" alt="pg_disorder" width="440">
 </h1>
 
 `pg_disorder` is a tiny PostgreSQL shared library that, when active, perturbs the row order of every eligible top-level `SELECT` that has no `ORDER BY`, either by reversing it (deterministic) or by applying a seeded pseudorandom permutation (shuffled).
