@@ -26,7 +26,7 @@
 
 PG_MODULE_MAGIC;
 
-#define PG_DISORDER_VERSION "0.2.0"
+#define PG_DISORDER_VERSION "0.1.0"
 
 void _PG_init(void);
 
