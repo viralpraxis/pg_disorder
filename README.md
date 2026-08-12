@@ -141,8 +141,9 @@ These shapes are currently passed through untouched, in both `reverse` and `shuf
 
 ## Real-world findings
 
-- [Ruby on Rails](https://github.com/rails/rails): [Bug #58177](https://github.com/rails/rails/pull/58177), [suite flaky tests](https://github.com/rails/rails/pull/58267)
-
+- Ruby on Rails: [bug #58177](https://github.com/rails/rails/pull/58177), [suite flaky tests](https://github.com/rails/rails/pull/58267)
+- Django: [suite flaky tests](https://github.com/django/django/pull/21745)
+- gitea: [bug #38850](https://github.com/go-gitea/gitea/pull/38850)
 ## Testing
 
 ```sh
