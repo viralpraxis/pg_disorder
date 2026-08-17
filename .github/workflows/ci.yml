@@ -9,10 +9,11 @@ jobs:
   test:
     name: PostgreSQL ${{ matrix.postgresql-version }}
     runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.postgresql-version == 19 }}
     strategy:
       fail-fast: false
       matrix:
-        postgresql-version: [14, 15, 16, 17, 18]
+        postgresql-version: [14, 15, 16, 17, 18, 19]
 
     container:
       image: pgxn/pgxn-tools
@@ -41,10 +42,11 @@ jobs:
     name: Crash sweep on PostgreSQL ${{ matrix.postgresql-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    continue-on-error: ${{ matrix.postgresql-version == 19 }}
     strategy:
       fail-fast: false
       matrix:
-        postgresql-version: [14, 15, 16, 17, 18]
+        postgresql-version: [14, 15, 16, 17, 18, 19]
 
     container:
       image: pgxn/pgxn-tools

@@ -5,6 +5,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_language_d.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -246,7 +247,11 @@ pg_disorder_add_shuffle_sort(Query *parse, int64 seed)
 
 static PlannedStmt *
 pg_disorder_planner(Query *parse, const char *query_string,
-        int cursorOptions, ParamListInfo boundParams)
+        int cursorOptions, ParamListInfo boundParams
+#if PG_VERSION_NUM >= 190000
+        , ExplainState *es
+#endif
+        )
 {
   PlannedStmt *volatile result = NULL;
 
@@ -269,10 +274,16 @@ pg_disorder_planner(Query *parse, const char *query_string,
   pg_disorder_nesting_level++;
   PG_TRY();
   {
+#if PG_VERSION_NUM >= 190000
+#define PG_DISORDER_PLANNER_ARGS parse, query_string, cursorOptions, boundParams, es
+#else
+#define PG_DISORDER_PLANNER_ARGS parse, query_string, cursorOptions, boundParams
+#endif
     if (prev_planner_hook)
-      result = prev_planner_hook(parse, query_string, cursorOptions, boundParams);
+      result = prev_planner_hook(PG_DISORDER_PLANNER_ARGS);
     else
-      result = standard_planner(parse, query_string, cursorOptions, boundParams);
+      result = standard_planner(PG_DISORDER_PLANNER_ARGS);
+#undef PG_DISORDER_PLANNER_ARGS
   }
   PG_FINALLY();
   {
