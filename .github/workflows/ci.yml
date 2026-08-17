@@ -22,7 +22,7 @@ jobs:
         run: pg-start ${{ matrix.postgresql-version }}
 
       - name: Check out the source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build, install, and run pg_regress
         env:
@@ -58,7 +58,7 @@ jobs:
         run: pg-start ${{ matrix.postgresql-version }}
 
       - name: Check out the source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build and install pg_disorder
         env:
@@ -133,7 +133,7 @@ jobs:
 
       - name: Upload sweep logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crash-sweep-${{ matrix.postgresql-version }}
           path: |
