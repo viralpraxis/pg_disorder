@@ -14,6 +14,7 @@ In practice PostgreSQL usually hands them back in insertion/physical order, so t
 
 - SQLite ships the [`reverse_unordered_selects`](https://sqlite.org/pragma.html#pragma_reverse_unordered_selects) pragma.
 - ClickHouse ships the [`inject_random_order_for_select_without_order_by`](https://clickhouse.com/docs/operations/settings/settings#inject_random_order_for_select_without_order_by) session setting.
+- [PostgreSQL mailing list discussion](https://www.postgresql.org/message-id/dac9b505-56d2-c852-805b-e1c902de113e%40BlueTreble.com)
 
 ## Installation
 
@@ -144,6 +145,11 @@ These shapes are currently passed through untouched, in both `reverse` and `shuf
 - Ruby on Rails: [bug #58177](https://github.com/rails/rails/pull/58177), [suite flaky tests](https://github.com/rails/rails/pull/58267)
 - Django: [suite flaky tests](https://github.com/django/django/pull/21745)
 - gitea: [bug #38850](https://github.com/go-gitea/gitea/pull/38850)
+
+## How it works
+
+For the `shuffle` mode, we inject a "resjunk" column with PRNG-double values and add an `ORDER BY` clause for this column to the planner. That hidden column is automatically pruned before being sent to a client
+
 ## Testing
 
 ```sh
