@@ -7,6 +7,8 @@
 SQL does not specify the order of rows returned by a `SELECT` without an `ORDER BY`.
 In practice PostgreSQL usually hands them back in insertion/physical order, so test suites accumulate assumptions like "the first row is the one I inserted first."
 
+See our [blog post](https://evilmartians.com/chronicles/dont-bet-on-select-order-shuffle-your-rows-see-what-folds) for details.
+
 > [!WARNING]
 > `pg_disorder` is not intended for use in production. Do not load it via the global `shared_preload_libraries` configuration option.
 
