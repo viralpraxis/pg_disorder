@@ -9,7 +9,6 @@ jobs:
   test:
     name: PostgreSQL ${{ matrix.postgresql-version }}
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.postgresql-version == 19 }}
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +41,6 @@ jobs:
     name: Crash sweep on PostgreSQL ${{ matrix.postgresql-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: ${{ matrix.postgresql-version == 19 }}
     strategy:
       fail-fast: false
       matrix:
